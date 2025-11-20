@@ -15,14 +15,12 @@ import argparse
 # Check for normalizer
 try:
     from khmernormalizer import normalize
-
     NORMALIZE_AVAILABLE = True
     print("✓ Using khmernormalizer")
 except ImportError:
     NORMALIZE_AVAILABLE = False
     print("⚠ khmernormalizer not available, install with: pip install khmernormalizer")
     normalize = lambda x: x
-
 
 def get_device():
     if torch.backends.mps.is_available():
@@ -31,30 +29,24 @@ def get_device():
         return torch.device("cuda")
     return torch.device("cpu")
 
-
 def get_transforms(width=512, height=64, is_train=True):
     """Dynamic transforms based on arguments"""
     if is_train:
-        return transforms.Compose(
-            [
-                transforms.Resize((height, width)),
-                transforms.RandomRotation(3, fill=255),
-                transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.1),
-                transforms.RandomAffine(degrees=0, translate=(0.05, 0.02), fill=255),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-                transforms.RandomErasing(p=0.1, scale=(0.02, 0.1)),
-            ]
-        )
+        return transforms.Compose([
+            transforms.Resize((height, width)),
+            transforms.RandomRotation(3, fill=255),
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.1),
+            transforms.RandomAffine(degrees=0, translate=(0.05, 0.02), fill=255),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            transforms.RandomErasing(p=0.1, scale=(0.02, 0.1)),
+        ])
     else:
-        return transforms.Compose(
-            [
-                transforms.Resize((height, width)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ]
-        )
-
+        return transforms.Compose([
+            transforms.Resize((height, width)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
 
 class KhmerDataset(Dataset):
     def __init__(self, parquet_path, transform=None):
@@ -95,7 +87,6 @@ class KhmerDataset(Dataset):
 
         return image, torch.tensor(encoded, dtype=torch.long), len(encoded)
 
-
 def collate_fn(batch):
     images, targets, target_lengths = zip(*batch)
     images = torch.stack(images, 0)
@@ -103,39 +94,22 @@ def collate_fn(batch):
     targets = torch.cat(targets)
     return images, targets, target_lengths
 
-
 class ImprovedCRNN(nn.Module):
     def __init__(self, vocab_size, hidden_size=256):
         super(ImprovedCRNN, self).__init__()
 
         # CNN
         self.cnn = nn.Sequential(
-            nn.Conv2d(3, 64, 3, 1, 1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            nn.MaxPool2d(2, 2),
-            nn.Dropout2d(0.1),
-            nn.Conv2d(64, 128, 3, 1, 1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            nn.MaxPool2d(2, 2),
-            nn.Dropout2d(0.1),
-            nn.Conv2d(128, 256, 3, 1, 1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(True),
-            nn.Conv2d(256, 256, 3, 1, 1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(True),
-            nn.MaxPool2d((2, 1)),
-            nn.Dropout2d(0.1),
-            nn.Conv2d(256, 512, 3, 1, 1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(True),
-            nn.Conv2d(512, 512, 3, 1, 1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(True),
-            nn.MaxPool2d((2, 1)),
-            nn.Dropout2d(0.1),
+            nn.Conv2d(3, 64, 3, 1, 1), nn.BatchNorm2d(64), nn.ReLU(True),
+            nn.MaxPool2d(2, 2), nn.Dropout2d(0.1),
+            nn.Conv2d(64, 128, 3, 1, 1), nn.BatchNorm2d(128), nn.ReLU(True),
+            nn.MaxPool2d(2, 2), nn.Dropout2d(0.1),
+            nn.Conv2d(128, 256, 3, 1, 1), nn.BatchNorm2d(256), nn.ReLU(True),
+            nn.Conv2d(256, 256, 3, 1, 1), nn.BatchNorm2d(256), nn.ReLU(True),
+            nn.MaxPool2d((2, 1)), nn.Dropout2d(0.1),
+            nn.Conv2d(256, 512, 3, 1, 1), nn.BatchNorm2d(512), nn.ReLU(True),
+            nn.Conv2d(512, 512, 3, 1, 1), nn.BatchNorm2d(512), nn.ReLU(True),
+            nn.MaxPool2d((2, 1)), nn.Dropout2d(0.1),
         )
 
         # RNN
@@ -151,7 +125,6 @@ class ImprovedCRNN(nn.Module):
         rnn_out = self.dropout(rnn_out)
         return self.fc(rnn_out)
 
-
 def decode_prediction(output, idx_to_char):
     probs = output.softmax(2)
     _, preds = probs.max(2)
@@ -163,7 +136,6 @@ def decode_prediction(output, idx_to_char):
     prev_char = None
     for i, idx in enumerate(preds):
         idx = idx.item()
-        # REMOVED CONFIDENCE THRESHOLD FOR TRAINING VISIBILITY
         if idx != 0 and idx != prev_char:
             char = idx_to_char.get(idx, "")
             if char and char != "<BLANK>":
@@ -171,14 +143,16 @@ def decode_prediction(output, idx_to_char):
         prev_char = idx
     return "".join(decoded)
 
-
 def test_predictions(model, dataloader, device, idx_to_char, num_samples=5):
     model.eval()
+    # On Mac with num_workers=0, getting next(iter()) is fast and stable
     images, targets, target_lengths = next(iter(dataloader))
     images = images.to(device)
 
     with torch.no_grad():
         outputs = model(images)
+        # MAC FIX: Move outputs to CPU for decoding to match training logic
+        outputs_cpu = outputs.cpu()
 
     print("\n" + "=" * 70)
     print("SAMPLE PREDICTIONS")
@@ -194,7 +168,7 @@ def test_predictions(model, dataloader, device, idx_to_char, num_samples=5):
         start += length
 
     for i in range(min(num_samples, images.size(0))):
-        pred_text = decode_prediction(outputs[i : i + 1], idx_to_char)
+        pred_text = decode_prediction(outputs_cpu[i : i + 1], idx_to_char)
         predictions.append(pred_text)
 
     for i, (pred, gt) in enumerate(zip(predictions, ground_truths)):
@@ -202,11 +176,12 @@ def test_predictions(model, dataloader, device, idx_to_char, num_samples=5):
         acc = (match / max(len(gt), 1)) * 100
         print(f"Truth: {gt}\nPred:  {pred}\nAcc:   {acc:.1f}%\n")
 
-    return 0  # Just for logging
-
+    return 0
 
 def train_model(model, train_loader, val_loader, device, epochs, lr, save_path):
+    # CTCLoss needs to run on CPU to avoid MPS instability
     criterion = nn.CTCLoss(blank=0, zero_infinity=True)
+    
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0001, betas=(0.9, 0.999))
 
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -233,13 +208,27 @@ def train_model(model, train_loader, val_loader, device, epochs, lr, save_path):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs} [Train]")
 
         for images, targets, target_lengths in pbar:
-            images, targets, target_lengths = images.to(device), targets.to(device), target_lengths.to(device)
+            # Only move images to GPU/MPS
+            images = images.to(device)
+            
             optimizer.zero_grad()
+            
+            # 1. Forward pass on GPU
             outputs = model(images)
-            log_probs = outputs.permute(1, 0, 2).log_softmax(2)
-            input_lengths = torch.full((images.size(0),), log_probs.size(0), dtype=torch.long, device=device)
+            
+            # 2. MAC STABILITY FIX: Move to CPU *before* log_softmax
+            # This prevents NaNs that occur when doing log_softmax on MPS
+            log_probs = outputs.permute(1, 0, 2).cpu().log_softmax(2)
+            
+            input_lengths = torch.full((images.size(0),), log_probs.size(0), dtype=torch.long)
 
+<<<<<<< HEAD
             loss = criterion(log_probs, targets, input_lengths, target_lengths)
+=======
+            # 3. Calculate Loss on CPU (Targets are already on CPU)
+            loss = criterion(log_probs, targets, input_lengths, target_lengths)
+            
+>>>>>>> 25d48e0 (Fixed the CTCLoss issue which result in mac not training the model properly)
             if not (torch.isnan(loss) or torch.isinf(loss)):
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -247,6 +236,9 @@ def train_model(model, train_loader, val_loader, device, epochs, lr, save_path):
                 scheduler.step()
                 train_loss += loss.item()
                 pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+            else:
+                # This should happen much less frequently now
+                print("Warning: NaN loss detected (batch skipped)")
 
         avg_train_loss = train_loss / len(train_loader)
         history["train_loss"].append(avg_train_loss)
@@ -256,11 +248,22 @@ def train_model(model, train_loader, val_loader, device, epochs, lr, save_path):
         val_loss = 0
         with torch.no_grad():
             for images, targets, target_lengths in tqdm(val_loader, desc="[Val]"):
-                images, targets, target_lengths = images.to(device), targets.to(device), target_lengths.to(device)
+                images = images.to(device)
+                
                 outputs = model(images)
+<<<<<<< HEAD
                 log_probs = outputs.permute(1, 0, 2).log_softmax(2)
                 input_lengths = torch.full((images.size(0),), log_probs.size(0), dtype=torch.long, device=device)
                 loss = criterion(log_probs, targets, input_lengths, target_lengths)
+=======
+                
+                # Same fix for validation to get accurate metrics
+                log_probs = outputs.permute(1, 0, 2).cpu().log_softmax(2)
+                input_lengths = torch.full((images.size(0),), log_probs.size(0), dtype=torch.long)
+                
+                loss = criterion(log_probs, targets, input_lengths, target_lengths)
+                
+>>>>>>> 25d48e0 (Fixed the CTCLoss issue which result in mac not training the model properly)
                 if not (torch.isnan(loss) or torch.isinf(loss)):
                     val_loss += loss.item()
 
@@ -276,7 +279,6 @@ def train_model(model, train_loader, val_loader, device, epochs, lr, save_path):
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             patience_counter = 0
-            # Save full checkpoint including optimizer to resume later if needed
             torch.save(
                 {
                     "epoch": epoch,
@@ -295,7 +297,6 @@ def train_model(model, train_loader, val_loader, device, epochs, lr, save_path):
         print("-" * 70)
 
     return history
-
 
 def main():
     parser = argparse.ArgumentParser(description="Train Khmer OCR Model")
@@ -348,12 +349,12 @@ def main():
         )
     print(f"✓ Vocab saved to {vocab_path}")
 
-    # Loaders
+    # MAC FIX: num_workers=0 to prevent 'spawn' multiprocessing errors/slowness on macOS
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch, shuffle=True, num_workers=4, collate_fn=collate_fn, pin_memory=True
+        train_ds, batch_size=args.batch, shuffle=True, num_workers=0, collate_fn=collate_fn, pin_memory=True
     )
     val_loader = DataLoader(
-        val_ds, batch_size=args.batch, shuffle=False, num_workers=4, collate_fn=collate_fn, pin_memory=True
+        val_ds, batch_size=args.batch, shuffle=False, num_workers=0, collate_fn=collate_fn, pin_memory=True
     )
 
     # Model
@@ -370,7 +371,6 @@ def main():
     plt.legend()
     plt.savefig(args.output.replace(".pth", "_history.png"))
     print("Done.")
-
 
 if __name__ == "__main__":
     main()
