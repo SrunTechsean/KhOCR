@@ -1,0 +1,22 @@
+# Core Deep Learning
+torch
+torchvision
+torchaudio
+
+# Hugging Face Ecosystem (TrOCR)
+transformers
+datasets
+evaluate
+accelerate
+jiwer
+
+# Data Handling & Image Processing
+pandas
+pyarrow
+Pillow
+scikit-learn
+tqdm
+
+# Khmer Specific & Metrics
+khmernormalizer
+editdistance

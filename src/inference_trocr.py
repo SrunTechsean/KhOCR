@@ -11,7 +11,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Check paths before loading heavy libraries
     if not os.path.exists(args.image):
         print(f"Error: Image not found at {args.image}")
         return
@@ -34,10 +33,9 @@ def main():
     print(f"Loading model from: {args.model} ...")
 
     try:
-        # TrOCR loads from a DIRECTORY, finding config.json and pytorch_model.bin automatically
         processor = TrOCRProcessor.from_pretrained(args.model)
         model = VisionEncoderDecoderModel.from_pretrained(args.model).to(device)
-        model.eval()  # Set to evaluation mode
+        model.eval()
     except Exception as e:
         print(f"\nFailed to load model. Did you pass the folder path?\nError: {e}")
         return
@@ -45,10 +43,8 @@ def main():
     try:
         image = Image.open(args.image).convert("RGB")
 
-        # Preprocess
         pixel_values = processor(images=image, return_tensors="pt").pixel_values.to(device)
 
-        # Generate
         with torch.no_grad():
             generated_ids = model.generate(pixel_values)
             generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
