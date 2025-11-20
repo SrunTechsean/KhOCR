@@ -3,6 +3,7 @@ Dataset Tools for Khmer OCR
 1. Extract images from parquet (for inspection)
 2. Add your own images to the dataset
 3. Create augmented data
+4. Split data with custom naming
 """
 
 import pandas as pd
@@ -12,7 +13,7 @@ import io
 import os
 from pathlib import Path
 import json
-
+import argparse
 
 # ============================================================================
 # PART 1: EXTRACT IMAGES FROM PARQUET (for inspection/backup)
@@ -22,10 +23,6 @@ import json
 def extract_parquet_to_images(parquet_path, output_dir="extracted_images"):
     """
     Extract images from parquet file to individual image files
-
-    Args:
-        parquet_path: Path to .parquet file
-        output_dir: Directory to save images
     """
     print(f"Loading {parquet_path}...")
     df = pd.read_parquet(parquet_path)
@@ -67,18 +64,6 @@ def extract_parquet_to_images(parquet_path, output_dir="extracted_images"):
 def images_to_parquet(image_dir, labels_file, output_parquet="custom_data.parquet"):
     """
     Convert your own images + labels to parquet format
-
-    Expected structure:
-    image_dir/
-        ├── image1.png
-        ├── image2.jpg
-        └── ...
-    labels_file: JSON like [{"filename": "image1.png", "text": "ចម្លើយ"}, ...]
-
-    Args:
-        image_dir: Directory containing images
-        labels_file: JSON file with labels
-        output_parquet: Output parquet filename
     """
     print(f"Loading labels from {labels_file}...")
     with open(labels_file, "r", encoding="utf-8") as f:
@@ -97,69 +82,26 @@ def images_to_parquet(image_dir, labels_file, output_parquet="custom_data.parque
             continue
 
         # Load image
-        img = Image.open(img_path).convert("RGB")
+        try:
+            img = Image.open(img_path).convert("RGB")
 
-        # Convert to bytes
-        img_buffer = io.BytesIO()
-        img.save(img_buffer, format="PNG")
-        img_bytes = img_buffer.getvalue()
+            # Convert to bytes
+            img_buffer = io.BytesIO()
+            img.save(img_buffer, format="PNG")
+            img_bytes = img_buffer.getvalue()
 
-        # Add to dataset
-        data.append({"image": {"bytes": img_bytes, "path": None}, "text": text})
+            # Add to dataset
+            data.append({"image": {"bytes": img_bytes, "path": None}, "text": text})
+        except Exception as e:
+            print(f"Error processing {filename}: {e}")
 
         if len(data) % 100 == 0:
             print(f"  Processed {len(data)} images...")
 
     if missing:
         print(f"⚠ Warning: {len(missing)} images not found")
-        print(f"  First few missing: {missing[:5]}")
 
     # Create DataFrame and save
-    df = pd.DataFrame(data)
-    df.to_parquet(output_parquet)
-
-    print(f"✓ Created {output_parquet} with {len(df)} samples")
-    return output_parquet
-
-
-def csv_to_parquet(csv_file, image_dir, output_parquet="custom_data.parquet"):
-    """
-    Convert CSV format to parquet
-
-    Expected CSV format:
-    filename,text
-    image1.png,ចម្លើយ
-    image2.jpg,កម្ពុជា
-
-    Args:
-        csv_file: Path to CSV file
-        image_dir: Directory containing images
-        output_parquet: Output parquet filename
-    """
-    print(f"Loading CSV from {csv_file}...")
-    df_csv = pd.read_csv(csv_file)
-
-    data = []
-    for idx, row in df_csv.iterrows():
-        filename = row["filename"]
-        text = row["text"]
-        img_path = os.path.join(image_dir, filename)
-
-        if not os.path.exists(img_path):
-            print(f"⚠ Skipping {filename} (not found)")
-            continue
-
-        # Load and convert image
-        img = Image.open(img_path).convert("RGB")
-        img_buffer = io.BytesIO()
-        img.save(img_buffer, format="PNG")
-        img_bytes = img_buffer.getvalue()
-
-        data.append({"image": {"bytes": img_bytes, "path": None}, "text": text})
-
-        if (idx + 1) % 100 == 0:
-            print(f"  Processed {idx + 1}/{len(df_csv)} images...")
-
     df = pd.DataFrame(data)
     df.to_parquet(output_parquet)
 
@@ -175,10 +117,6 @@ def csv_to_parquet(csv_file, image_dir, output_parquet="custom_data.parquet"):
 def merge_parquet_files(parquet_files, output_file="merged_dataset.parquet"):
     """
     Merge multiple parquet files into one
-
-    Args:
-        parquet_files: List of parquet file paths
-        output_file: Output merged parquet file
     """
     print(f"Merging {len(parquet_files)} parquet files...")
 
@@ -203,24 +141,13 @@ def merge_parquet_files(parquet_files, output_file="merged_dataset.parquet"):
 
 
 # ============================================================================
-# PART 4: DATA AUGMENTATION (Create more training data)
+# PART 4: DATA AUGMENTATION
 # ============================================================================
 
 
 def augment_dataset(parquet_path, output_parquet="augmented_data.parquet", num_augments=2):
     """
     Create augmented versions of existing data
-
-    Augmentations:
-    - Rotation (-5 to +5 degrees)
-    - Brightness adjustment
-    - Contrast adjustment
-    - Slight blur
-
-    Args:
-        parquet_path: Input parquet file
-        output_parquet: Output augmented parquet file
-        num_augments: Number of augmented versions per image
     """
     from PIL import ImageEnhance, ImageFilter
     import random
@@ -242,12 +169,12 @@ def augment_dataset(parquet_path, output_parquet="augmented_data.parquet", num_a
             angle = random.uniform(-5, 5)
             aug_img = aug_img.rotate(angle, fillcolor="white")
 
-            # Random brightness (0.8 to 1.2)
+            # Random brightness
             brightness = random.uniform(0.8, 1.2)
             enhancer = ImageEnhance.Brightness(aug_img)
             aug_img = enhancer.enhance(brightness)
 
-            # Random contrast (0.8 to 1.2)
+            # Random contrast
             contrast = random.uniform(0.8, 1.2)
             enhancer = ImageEnhance.Contrast(aug_img)
             aug_img = enhancer.enhance(contrast)
@@ -271,24 +198,24 @@ def augment_dataset(parquet_path, output_parquet="augmented_data.parquet", num_a
     aug_df.to_parquet(output_parquet)
 
     print(f"✓ Created {output_parquet} with {len(aug_df)} augmented samples")
-    print(f"  Original: {len(df)}, Augmented: {len(aug_df)} ({num_augments}x)")
     return output_parquet
 
 
 # ============================================================================
-# PART 5: SPLIT DATASET (train/val/test)
+# PART 5: SPLIT DATASET (UPDATED)
 # ============================================================================
 
 
-def split_dataset(parquet_path, train_ratio=0.8, val_ratio=0.1, test_ratio=0.1):
+def split_dataset(parquet_path, train_ratio=0.8, val_ratio=0.1, test_ratio=0.1, output_prefix="data"):
     """
-    Split parquet dataset into train/val/test sets
+    Split parquet dataset into train/val/test sets with custom naming.
 
     Args:
         parquet_path: Input parquet file
-        train_ratio: Proportion for training (0.8 = 80%)
+        train_ratio: Proportion for training
         val_ratio: Proportion for validation
         test_ratio: Proportion for testing
+        output_prefix: Prefix for output files (e.g., "data/clean" -> "data/clean_train.parquet")
     """
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 0.001, "Ratios must sum to 1"
 
@@ -308,15 +235,27 @@ def split_dataset(parquet_path, train_ratio=0.8, val_ratio=0.1, test_ratio=0.1):
     val_df = df[train_end:val_end]
     test_df = df[val_end:]
 
+    # Ensure directory exists
+    dirname = os.path.dirname(output_prefix)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
+
+    # Define output filenames based on prefix
+    train_out = f"{output_prefix}_train.parquet"
+    val_out = f"{output_prefix}_val.parquet"
+    test_out = f"{output_prefix}_test.parquet"
+
     # Save
-    train_df.to_parquet("trainset.parquet")
-    val_df.to_parquet("validset.parquet")
-    test_df.to_parquet("testset.parquet")
+    train_df.to_parquet(train_out)
+    val_df.to_parquet(val_out)
+    test_df.to_parquet(test_out)
 
     print(f"✓ Dataset split complete:")
-    print(f"  Train: {len(train_df)} samples → trainset.parquet")
-    print(f"  Val:   {len(val_df)} samples → validset.parquet")
-    print(f"  Test:  {len(test_df)} samples → testset.parquet")
+    print(f"  Train: {len(train_df)} samples → {train_out}")
+    print(f"  Val:   {len(val_df)} samples → {val_out}")
+    print(f"  Test:  {len(test_df)} samples → {test_out}")
+
+    return train_out, val_out, test_out
 
 
 # ============================================================================
@@ -325,8 +264,6 @@ def split_dataset(parquet_path, train_ratio=0.8, val_ratio=0.1, test_ratio=0.1):
 
 
 def main():
-    import argparse
-
     parser = argparse.ArgumentParser(description="Khmer OCR Dataset Tools")
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
@@ -352,9 +289,10 @@ def main():
     aug_parser.add_argument("-n", "--num", type=int, default=2, help="Augmentations per image")
     aug_parser.add_argument("-o", "--output", default="augmented_data.parquet", help="Output file")
 
-    # Split command
+    # Split command (UPDATED)
     split_parser = subparsers.add_parser("split", help="Split dataset into train/val/test")
     split_parser.add_argument("parquet", help="Input parquet file")
+    split_parser.add_argument("-o", "--output", default="dataset", help="Output prefix (e.g., 'data/clean')")
     split_parser.add_argument("--train", type=float, default=0.8, help="Train ratio")
     split_parser.add_argument("--val", type=float, default=0.1, help="Val ratio")
     split_parser.add_argument("--test", type=float, default=0.1, help="Test ratio")
@@ -370,30 +308,10 @@ def main():
     elif args.command == "augment":
         augment_dataset(args.parquet, args.output, args.num)
     elif args.command == "split":
-        split_dataset(args.parquet, args.train, args.val, args.test)
+        split_dataset(args.parquet, args.train, args.val, args.test, args.output)
     else:
         parser.print_help()
 
 
 if __name__ == "__main__":
-    # Example usage without CLI:
-
-    # 1. Extract existing parquet to inspect
-    # extract_parquet_to_images('data/trainset.parquet', 'extracted_train')
-
-    # 2. Add your own data
-    # images_to_parquet('my_images/', 'my_labels.json', 'my_custom_data.parquet')
-
-    # 3. Merge with existing dataset
-    # merge_parquet_files([
-    #     'data/trainset.parquet',
-    #     'my_custom_data.parquet'
-    # ], 'combined_trainset.parquet')
-
-    # 4. Augment to create more data
-    # augment_dataset('combined_trainset.parquet', 'augmented_train.parquet', num_augments=3)
-
-    # 5. Split into train/val/test
-    # split_dataset('augmented_train.parquet')
-
     main()
