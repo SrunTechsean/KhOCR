@@ -1,20 +1,6 @@
 import argparse
 import os
-import pandas as pd
-import torch
-from PIL import Image
-import io
-from datasets import Dataset
-import evaluate
-from transformers import (
-    TrOCRProcessor,
-    VisionEncoderDecoderModel,
-    Seq2SeqTrainer,
-    Seq2SeqTrainingArguments,
-    default_data_collator,
-    AutoTokenizer,
-    ViTImageProcessor
-)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Universal TrOCR Training Script (Khmer)")
@@ -40,6 +26,22 @@ def main():
     # Device check
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"✓ Device: {device}")
+
+    import pandas as pd
+    import torch
+    from PIL import Image
+    import io
+    from datasets import Dataset
+    import evaluate
+    from transformers import (
+        TrOCRProcessor,
+        VisionEncoderDecoderModel,
+        Seq2SeqTrainer,
+        Seq2SeqTrainingArguments,
+        default_data_collator,
+        AutoTokenizer,
+        ViTImageProcessor
+    )
 
     # ---------------------------------------------------------
     # 1. TEXT NORMALIZATION (FIXING UNICODE & COENG)
