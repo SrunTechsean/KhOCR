@@ -388,6 +388,21 @@ def main():
 
     model = ImprovedCRNN(vocab_size=train_ds.vocab_size).to(device)
 
+    if args.resume:
+        print(f"Loading pre-trained weights from {args.resume}...")
+        try:
+            # map_location ensures we can load a GPU model onto a CPU/Mac if needed
+            checkpoint = torch.load(args.resume, map_location=device)
+
+            if "model_state_dict" in checkpoint:
+                model.load_state_dict(checkpoint["model_state_dict"])
+            else:
+                model.load_state_dict(checkpoint)
+            print("✓ Weights loaded successfully. Starting fine-tuning...")
+        except Exception as e:
+            print(f"Error loading resume file: {e}")
+            sys.exit(1)
+
     history = train_model(model, train_loader, val_loader, device, args.epochs, args.lr, args.output)
 
     plt.figure(figsize=(10, 5))
