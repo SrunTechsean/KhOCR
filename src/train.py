@@ -4,22 +4,24 @@ import os
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Khmer OCR Model (CRNN) - Mac Optimized")
+    parser = argparse.ArgumentParser(description="Train Khmer OCR Model (CRNN) - Mac/MPS Optimized")
     parser.add_argument("--train", type=str, required=True, help="Path to training parquet file")
     parser.add_argument("--val", type=str, required=True, help="Path to validation parquet file")
     parser.add_argument("--output", type=str, default="best_khmer_ocr_model.pth", help="Path to save trained model")
-    parser.add_argument("--width", type=int, default=512, help="Image width (recommended: 512)")
+    parser.add_argument("--resume", type=str, default=None, help="Path to a pre-trained .pth file to fine-tune")
+    parser.add_argument("--width", type=int, default=512, help="Image width (recommended: 512 for full sentences)")
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
-    parser.add_argument("--batch", type=int, default=32, help="Batch size")
-    parser.add_argument("--lr", type=float, default=0.0003, help="Learning Rate")
+    parser.add_argument("--batch", type=int, default=32, help="Batch size (lower if Out Of Memory)")
+    parser.add_argument("--lr", type=float, default=0.0003, help="Learning Rate (use 0.0001 for fine-tuning)")
 
     args = parser.parse_args()
 
     print("=" * 70)
-    print(f"KHMER OCR TRAINING CONFIG (Mac Optimized)")
+    print(f"KHMER OCR TRAINING CONFIG")
     print(f"Train Data:  {args.train}")
     print(f"Val Data:    {args.val}")
     print(f"Output:      {args.output}")
+    print(f"Resume From: {args.resume if args.resume else 'None (Scratch)'}")
     print(f"Image Size:  64x{args.width}")
     print("=" * 70)
     print("Loading libraries... (this may take a few seconds)")
@@ -44,30 +46,38 @@ def main():
         print("✓ Using khmernormalizer")
     except ImportError:
         NORMALIZE_AVAILABLE = False
-        print("⚠ khmernormalizer not available, install with: pip install khmernormalizer")
+        print("⚠ khmernormalizer not available. Recommendation: pip install khmernormalizer")
         normalize = lambda x: x
 
     def get_device():
+        # MPS (Metal Performance Shaders) is the specific accelerator for Mac M1/M2/M3 chips.
         if torch.backends.mps.is_available():
             print("✓ Using Apple MPS (Metal Performance Shaders)")
             return torch.device("mps")
         elif torch.cuda.is_available():
             print("✓ Using NVIDIA CUDA")
             return torch.device("cuda")
-        print("⚠ Using CPU (Slow)")
+        print("⚠ Using CPU (Training will be slow)")
         return torch.device("cpu")
 
     def get_transforms(width=512, height=64, is_train=True):
+        # We resize to a fixed height (64) but a wide width (512).
+        # This preserves the aspect ratio of long sentences, preventing characters
+        # from getting squashed together which confuses the RNN.
         if is_train:
             return transforms.Compose(
                 [
                     transforms.Resize((height, width)),
-                    transforms.RandomRotation(3, fill=255),
-                    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.1),
+                    transforms.RandomRotation(3, fill=255),  # Simulates slightly crooked scanning
+                    transforms.ColorJitter(
+                        brightness=0.3, contrast=0.3, saturation=0.1
+                    ),  # Simulates different lighting/ink
                     transforms.RandomAffine(degrees=0, translate=(0.05, 0.02), fill=255),
                     transforms.ToTensor(),
                     transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-                    transforms.RandomErasing(p=0.1, scale=(0.02, 0.1)),
+                    transforms.RandomErasing(
+                        p=0.1, scale=(0.02, 0.1)
+                    ),  # Forces model to learn context if a letter is blocked
                 ]
             )
         else:
@@ -85,13 +95,15 @@ def main():
             self.df = pd.read_parquet(parquet_path)
             self.transform = transform
 
+            # Normalization fixes Unicode ordering issues (swapping vowels/sub-consonants)
+            # that look identical to humans but are different bytes to the computer.
             if NORMALIZE_AVAILABLE:
                 self.df["text"] = self.df["text"].apply(normalize)
 
             all_text = " ".join(self.df["text"].values)
             self.chars = sorted(list(set(all_text)))
             self.char_to_idx = {char: idx + 1 for idx, char in enumerate(self.chars)}
-            self.char_to_idx["<BLANK>"] = 0
+            self.char_to_idx["<BLANK>"] = 0  # CTC Loss requires a reserved blank token at 0
             self.idx_to_char = {idx: char for char, idx in self.char_to_idx.items()}
             self.vocab_size = len(self.char_to_idx)
 
@@ -112,6 +124,7 @@ def main():
             encoded = [self.char_to_idx.get(char, 0) for char in text if char in self.char_to_idx]
             encoded = [x for x in encoded if x != 0]
 
+            # CTC loss will crash if target length is 0
             if len(encoded) == 0:
                 encoded = [1]
 
@@ -121,12 +134,17 @@ def main():
         images, targets, target_lengths = zip(*batch)
         images = torch.stack(images, 0)
         target_lengths = torch.tensor(target_lengths, dtype=torch.long)
+        # Targets must be concatenated into one long 1D tensor for CTC Loss
         targets = torch.cat(targets)
         return images, targets, target_lengths
 
     class ImprovedCRNN(nn.Module):
         def __init__(self, vocab_size, hidden_size=256):
             super(ImprovedCRNN, self).__init__()
+
+            # CNN: Feature Extractor
+            # We use MaxPool((2,1)) in later layers to squash Height but preserve Width.
+            # This is crucial for OCR because text is wide, we need high horizontal resolution.
             self.cnn = nn.Sequential(
                 nn.Conv2d(3, 64, 3, 1, 1),
                 nn.BatchNorm2d(64),
@@ -155,6 +173,10 @@ def main():
                 nn.MaxPool2d((2, 1)),
                 nn.Dropout2d(0.1),
             )
+
+            # RNN: Sequence Modeler
+            # Bidirectional LSTM allows the model to use context from both left and right
+            # to resolve ambiguous characters.
             self.rnn = nn.LSTM(512 * 4, hidden_size, bidirectional=True, num_layers=3, batch_first=True, dropout=0.2)
             self.dropout = nn.Dropout(0.2)
             self.fc = nn.Linear(hidden_size * 2, vocab_size)
@@ -162,11 +184,13 @@ def main():
         def forward(self, x):
             conv_out = self.cnn(x)
             batch, channel, height, width = conv_out.size()
+            # Reshape CNN output to be (Batch, Width, Features) for the RNN
             conv_out = conv_out.permute(0, 3, 1, 2).contiguous().view(batch, width, channel * height)
             rnn_out, _ = self.rnn(conv_out)
             return self.fc(self.dropout(rnn_out))
 
     def decode_prediction(output, idx_to_char):
+        # Take the highest probability character at each step
         probs = output.softmax(2)
         _, preds = probs.max(2)
         if preds.dim() > 1:
@@ -177,6 +201,7 @@ def main():
         prev_char = None
         for i, idx in enumerate(preds):
             idx = idx.item()
+            # CTC requires collapsing repeats (AA -> A) and removing blanks
             if idx != 0 and idx != prev_char:
                 char = idx_to_char.get(idx, "")
                 if char and char != "<BLANK>":
@@ -186,13 +211,13 @@ def main():
 
     def test_predictions(model, dataloader, device, idx_to_char, num_samples=5):
         model.eval()
-        # On Mac, simple iteration is safer
         images, targets, target_lengths = next(iter(dataloader))
         images = images.to(device)
 
         with torch.no_grad():
             outputs = model(images)
-            # Move to CPU for decoding
+            # Must move outputs to CPU before decoding because basic python operations
+            # interact better with CPU tensors, and it prevents MPS synchronization bugs.
             outputs_cpu = outputs.cpu()
 
         print("\n" + "=" * 70)
@@ -220,8 +245,10 @@ def main():
         return 0
 
     def train_model(model, train_loader, val_loader, device, epochs, lr, save_path):
-        # CTCLoss runs on CPU for stability
+        # CTCLoss is calculated on CPU to avoid Not a Number errors that often
+        # happen on Mac MPS accelerators with this specific loss function.
         criterion = nn.CTCLoss(blank=0, zero_infinity=True)
+
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0001, betas=(0.9, 0.999))
 
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -248,25 +275,22 @@ def main():
             pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs} [Train]")
 
             for images, targets, target_lengths in pbar:
-                # Move images to GPU (MPS/CUDA)
                 images = images.to(device)
 
                 optimizer.zero_grad()
 
-                # 1. Forward pass on GPU
                 outputs = model(images)
 
-                # 2. MAC STABILITY FIX: Move to CPU *before* log_softmax
-                # This prevents NaN errors common on M1/M2/M3 chips with CTCLoss
+                # Move to CPU *before* log_softmax to ensure numerical stability on Mac/MPS
                 log_probs = outputs.permute(1, 0, 2).cpu().log_softmax(2)
+
                 input_lengths = torch.full((images.size(0),), log_probs.size(0), dtype=torch.long)
 
-                # 3. Loss on CPU
                 loss = criterion(log_probs, targets, input_lengths, target_lengths)
 
                 if not (torch.isnan(loss) or torch.isinf(loss)):
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)  # Prevents exploding gradients
                     optimizer.step()
                     scheduler.step()
                     train_loss += loss.item()
@@ -283,13 +307,11 @@ def main():
             with torch.no_grad():
                 for images, targets, target_lengths in tqdm(val_loader, desc="[Val]"):
                     images = images.to(device)
-
                     outputs = model(images)
 
-                    # Same CPU fix for validation
+                    # Use same CPU logic for validation to keep metrics consistent
                     log_probs = outputs.permute(1, 0, 2).cpu().log_softmax(2)
                     input_lengths = torch.full((images.size(0),), log_probs.size(0), dtype=torch.long)
-
                     loss = criterion(log_probs, targets, input_lengths, target_lengths)
 
                     if not (torch.isnan(loss) or torch.isinf(loss)):
@@ -307,6 +329,7 @@ def main():
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 patience_counter = 0
+                # We save the optimizer state too, in case you want to resume exact training state later
                 torch.save(
                     {
                         "epoch": epoch,
@@ -328,7 +351,6 @@ def main():
 
     device = get_device()
 
-    # Get transforms
     t_train = get_transforms(width=args.width, is_train=True)
     t_val = get_transforms(width=args.width, is_train=False)
 
@@ -356,8 +378,7 @@ def main():
         )
     print(f"✓ Vocab saved to {vocab_path}")
 
-    # MAC OPTIMIZATION: num_workers=0
-    # Mac multiprocess loaders often stall or crash. 0 is safest.
+    # Mac/MPS optimization: keep num_workers=0 to avoid multiprocessing overhead/crashes
     train_loader = DataLoader(
         train_ds, batch_size=args.batch, shuffle=True, num_workers=0, collate_fn=collate_fn, pin_memory=True
     )
@@ -380,4 +401,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
