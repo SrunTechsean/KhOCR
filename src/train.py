@@ -4,7 +4,7 @@ import os
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Khmer OCR Model (CRNN)")
+    parser = argparse.ArgumentParser(description="Train Khmer OCR Model (CRNN) - Mac Optimized")
     parser.add_argument("--train", type=str, required=True, help="Path to training parquet file")
     parser.add_argument("--val", type=str, required=True, help="Path to validation parquet file")
     parser.add_argument("--output", type=str, default="best_khmer_ocr_model.pth", help="Path to save trained model")
@@ -16,7 +16,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 70)
-    print("KHMER OCR TRAINING CONFIG")
+    print(f"KHMER OCR TRAINING CONFIG (Mac Optimized)")
     print(f"Train Data:  {args.train}")
     print(f"Val Data:    {args.val}")
     print(f"Output:      {args.output}")
@@ -36,6 +36,7 @@ def main():
     import matplotlib.pyplot as plt
     import json
 
+    # Check for normalizer
     try:
         from khmernormalizer import normalize
 
@@ -48,13 +49,15 @@ def main():
 
     def get_device():
         if torch.backends.mps.is_available():
+            print("✓ Using Apple MPS (Metal Performance Shaders)")
             return torch.device("mps")
         elif torch.cuda.is_available():
+            print("✓ Using NVIDIA CUDA")
             return torch.device("cuda")
+        print("⚠ Using CPU (Slow)")
         return torch.device("cpu")
 
     def get_transforms(width=512, height=64, is_train=True):
-        """Dynamic transforms based on arguments"""
         if is_train:
             return transforms.Compose(
                 [
@@ -85,7 +88,6 @@ def main():
             if NORMALIZE_AVAILABLE:
                 self.df["text"] = self.df["text"].apply(normalize)
 
-            # Build vocabulary
             all_text = " ".join(self.df["text"].values)
             self.chars = sorted(list(set(all_text)))
             self.char_to_idx = {char: idx + 1 for idx, char in enumerate(self.chars)}
@@ -122,11 +124,9 @@ def main():
         targets = torch.cat(targets)
         return images, targets, target_lengths
 
-    class CRNN(nn.Module):
+    class ImprovedCRNN(nn.Module):
         def __init__(self, vocab_size, hidden_size=256):
-            super(CRNN, self).__init__()
-
-            # CNN
+            super(ImprovedCRNN, self).__init__()
             self.cnn = nn.Sequential(
                 nn.Conv2d(3, 64, 3, 1, 1),
                 nn.BatchNorm2d(64),
@@ -155,8 +155,6 @@ def main():
                 nn.MaxPool2d((2, 1)),
                 nn.Dropout2d(0.1),
             )
-
-            # RNN
             self.rnn = nn.LSTM(512 * 4, hidden_size, bidirectional=True, num_layers=3, batch_first=True, dropout=0.2)
             self.dropout = nn.Dropout(0.2)
             self.fc = nn.Linear(hidden_size * 2, vocab_size)
@@ -166,8 +164,7 @@ def main():
             batch, channel, height, width = conv_out.size()
             conv_out = conv_out.permute(0, 3, 1, 2).contiguous().view(batch, width, channel * height)
             rnn_out, _ = self.rnn(conv_out)
-            rnn_out = self.dropout(rnn_out)
-            return self.fc(rnn_out)
+            return self.fc(self.dropout(rnn_out))
 
     def decode_prediction(output, idx_to_char):
         probs = output.softmax(2)
@@ -189,11 +186,14 @@ def main():
 
     def test_predictions(model, dataloader, device, idx_to_char, num_samples=5):
         model.eval()
+        # On Mac, simple iteration is safer
         images, targets, target_lengths = next(iter(dataloader))
         images = images.to(device)
 
         with torch.no_grad():
             outputs = model(images)
+            # Move to CPU for decoding
+            outputs_cpu = outputs.cpu()
 
         print("\n" + "=" * 70)
         print("SAMPLE PREDICTIONS")
@@ -209,7 +209,7 @@ def main():
             start += length
 
         for i in range(min(num_samples, images.size(0))):
-            pred_text = decode_prediction(outputs[i : i + 1], idx_to_char)
+            pred_text = decode_prediction(outputs_cpu[i : i + 1], idx_to_char)
             predictions.append(pred_text)
 
         for i, (pred, gt) in enumerate(zip(predictions, ground_truths)):
@@ -220,6 +220,7 @@ def main():
         return 0
 
     def train_model(model, train_loader, val_loader, device, epochs, lr, save_path):
+        # CTCLoss runs on CPU for stability
         criterion = nn.CTCLoss(blank=0, zero_infinity=True)
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0001, betas=(0.9, 0.999))
 
@@ -247,13 +248,22 @@ def main():
             pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs} [Train]")
 
             for images, targets, target_lengths in pbar:
-                images, targets, target_lengths = images.to(device), targets.to(device), target_lengths.to(device)
-                optimizer.zero_grad()
-                outputs = model(images)
-                log_probs = outputs.permute(1, 0, 2).log_softmax(2)
-                input_lengths = torch.full((images.size(0),), log_probs.size(0), dtype=torch.long, device=device)
+                # Move images to GPU (MPS/CUDA)
+                images = images.to(device)
 
+                optimizer.zero_grad()
+
+                # 1. Forward pass on GPU
+                outputs = model(images)
+
+                # 2. MAC STABILITY FIX: Move to CPU *before* log_softmax
+                # This prevents NaN errors common on M1/M2/M3 chips with CTCLoss
+                log_probs = outputs.permute(1, 0, 2).cpu().log_softmax(2)
+                input_lengths = torch.full((images.size(0),), log_probs.size(0), dtype=torch.long)
+
+                # 3. Loss on CPU
                 loss = criterion(log_probs, targets, input_lengths, target_lengths)
+
                 if not (torch.isnan(loss) or torch.isinf(loss)):
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -261,6 +271,8 @@ def main():
                     scheduler.step()
                     train_loss += loss.item()
                     pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+                else:
+                    print("Warning: NaN loss detected (batch skipped)")
 
             avg_train_loss = train_loss / len(train_loader)
             history["train_loss"].append(avg_train_loss)
@@ -270,11 +282,16 @@ def main():
             val_loss = 0
             with torch.no_grad():
                 for images, targets, target_lengths in tqdm(val_loader, desc="[Val]"):
-                    images, targets, target_lengths = images.to(device), targets.to(device), target_lengths.to(device)
+                    images = images.to(device)
+
                     outputs = model(images)
-                    log_probs = outputs.permute(1, 0, 2).log_softmax(2)
-                    input_lengths = torch.full((images.size(0),), log_probs.size(0), dtype=torch.long, device=device)
+
+                    # Same CPU fix for validation
+                    log_probs = outputs.permute(1, 0, 2).cpu().log_softmax(2)
+                    input_lengths = torch.full((images.size(0),), log_probs.size(0), dtype=torch.long)
+
                     loss = criterion(log_probs, targets, input_lengths, target_lengths)
+
                     if not (torch.isnan(loss) or torch.isinf(loss)):
                         val_loss += loss.item()
 
@@ -303,16 +320,15 @@ def main():
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
-                    print("⚠ Early stopping triggered.")
+                    print(f"⚠ Early stopping triggered.")
                     break
             print("-" * 70)
 
         return history
 
     device = get_device()
-    print(f"Device: {device}\n")
 
-    # Get transforms based on arguments
+    # Get transforms
     t_train = get_transforms(width=args.width, is_train=True)
     t_val = get_transforms(width=args.width, is_train=False)
 
@@ -340,21 +356,19 @@ def main():
         )
     print(f"✓ Vocab saved to {vocab_path}")
 
-    # Loaders
+    # MAC OPTIMIZATION: num_workers=0
+    # Mac multiprocess loaders often stall or crash. 0 is safest.
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch, shuffle=True, num_workers=4, collate_fn=collate_fn, pin_memory=True
+        train_ds, batch_size=args.batch, shuffle=True, num_workers=0, collate_fn=collate_fn, pin_memory=True
     )
     val_loader = DataLoader(
-        val_ds, batch_size=args.batch, shuffle=False, num_workers=4, collate_fn=collate_fn, pin_memory=True
+        val_ds, batch_size=args.batch, shuffle=False, num_workers=0, collate_fn=collate_fn, pin_memory=True
     )
 
-    # Model
-    model = CRNN(vocab_size=train_ds.vocab_size).to(device)
+    model = ImprovedCRNN(vocab_size=train_ds.vocab_size).to(device)
 
-    # Train
     history = train_model(model, train_loader, val_loader, device, args.epochs, args.lr, args.output)
 
-    # Plot
     plt.figure(figsize=(10, 5))
     plt.plot(history["train_loss"], label="Train Loss")
     plt.plot(history["val_loss"], label="Val Loss")
@@ -366,3 +380,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

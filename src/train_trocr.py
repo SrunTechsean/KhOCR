@@ -39,6 +39,10 @@ def main():
         default_data_collator,
     )
 
+    # Check if the program is using mps for my mac
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    print(f"✓ Using device: {device}")
+
     try:
         from khmernormalizer import normalize
 
