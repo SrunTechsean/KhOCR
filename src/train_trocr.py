@@ -1,7 +1,6 @@
 import argparse
 import os
 
-
 def main():
     parser = argparse.ArgumentParser(description="Universal TrOCR Training Script (Khmer)")
     
@@ -12,20 +11,16 @@ def main():
     
     # Model Arguments
     parser.add_argument("--checkpoint", type=str, default=None, 
-                        help="Path to local model folder (for Stage 2). If None, builds fresh Hybrid model (Stage 1).")
+                        help="Path to local model folder. If None, builds fresh Hybrid model.")
     
     # Hyperparameters
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--lr", type=float, default=4e-5)
     parser.add_argument("--max_len", type=int, default=128)
-    parser.add_argument("--fp16", action="store_true", help="Use mixed precision (faster on GPU)")
+    parser.add_argument("--fp16", action="store_true", help="Use mixed precision")
 
     args = parser.parse_args()
-    
-    # Device check
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"✓ Device: {device}")
 
     import pandas as pd
     import torch
@@ -40,57 +35,64 @@ def main():
         Seq2SeqTrainingArguments,
         default_data_collator,
         AutoTokenizer,
-        ViTImageProcessor
+        ViTImageProcessor,
+        XLMRobertaForCausalLM  # Imported for the decoder swap
     )
 
+    # Device check
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"✓ Device: {device}")
+
     # ---------------------------------------------------------
-    # 1. TEXT NORMALIZATION (FIXING UNICODE & COENG)
+    # 1. TEXT NORMALIZATION
     # ---------------------------------------------------------
     try:
         from khmernormalizer import normalize as kh_normalize
     except ImportError:
-        print("⚠ Warning: khmernormalizer not found. `pip install khmernormalizer`")
+        print("⚠ Warning: khmernormalizer not found.")
         kh_normalize = lambda x: x
 
     def clean_text(text):
         if text is None: return ""
-        # 1. Apply standard Khmer normalization (fixes Coeng order)
         text = kh_normalize(text)
-        # 2. Remove Zero Width Spaces (\u200b) and other invisible formatters
-        # These kill CER scores but are invisible
-        text = text.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')
-        # 3. Strip whitespace
-        return text.strip()
+        return text.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '').strip()
 
     # ---------------------------------------------------------
-    # 2. MODEL LOADING LOGIC
+    # 2. MODEL LOADING LOGIC (FIXED)
     # ---------------------------------------------------------
-    # Always need these for data processing
-    # Use stage1 for the visual backbone as it is more generic than 'handwritten'
     feature_extractor = ViTImageProcessor.from_pretrained("microsoft/trocr-base-stage1")
     tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base")
     processor = TrOCRProcessor(feature_extractor=feature_extractor, tokenizer=tokenizer)
 
     if args.checkpoint:
         print(f"🔄 STAGE 2: Loading Pre-trained model from: {args.checkpoint}")
-        # Load the weights you trained in Stage 1
         model = VisionEncoderDecoderModel.from_pretrained(args.checkpoint)
     else:
-        print("🆕 STAGE 1: Building Fresh Hybrid Model (ViT + XLM-R)")
-        # Create the Hybrid from scratch
-        model = VisionEncoderDecoderModel.from_encoder_decoder_pretrained(
-            "microsoft/trocr-base-stage1", 
-            "xlm-roberta-base"
-        )
+        print("🆕 STAGE 1: Building Fresh Hybrid Model (Manual Decoder Swap)")
         
-        # Set Model Configs for Fresh Model
+        # A. Load the Base TrOCR model (Vision Encoder)
+        model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-stage1")
+
+        # B. Load the Multilingual Decoder (Text Decoder)
+        # add_cross_attention=True is crucial to link Vision to Text
+        decoder = XLMRobertaForCausalLM.from_pretrained(
+            "xlm-roberta-base", 
+            is_decoder=True, 
+            add_cross_attention=True
+        )
+
+        # C. Swap the decoder
+        model.decoder = decoder
+
+        # D. Sync Configurations (CRITICAL STEP)
         model.config.decoder_start_token_id = tokenizer.cls_token_id
         model.config.pad_token_id = tokenizer.pad_token_id
         model.config.vocab_size = model.config.decoder.vocab_size
-        model.config.no_repeat_ngram_size = 0  # Important for Khmer
+        
+        # Khmer Specific Configs
+        model.config.no_repeat_ngram_size = 0
         model.config.num_beams = 4
 
-    # Ensure config matches dataset constraints
     model.config.max_length = args.max_len
     model.config.early_stopping = True
     model.to(device)
@@ -101,26 +103,19 @@ def main():
     def load_parquet_dataset(parquet_path):
         print(f"Loading {parquet_path}...")
         df = pd.read_parquet(parquet_path)
-        
-        # Apply the cleaning
         df["text"] = df["text"].apply(clean_text)
-        df = df[df["text"].str.len() > 0] # Remove empty labels
+        df = df[df["text"].str.len() > 0] 
 
         def gen():
             for idx, row in df.iterrows():
                 try:
-                    # Handle different parquet structures (sometimes image is dict, sometimes bytes)
                     img_data = row["image"]
                     if isinstance(img_data, dict) and "bytes" in img_data:
                         image = Image.open(io.BytesIO(img_data["bytes"])).convert("RGB")
                     else:
-                        # If it's already raw bytes or a path (adjust based on your parquet)
                         image = Image.open(io.BytesIO(img_data)).convert("RGB")
-                        
                     yield {"image": image, "text": row["text"]}
-                except Exception as e:
-                    continue
-
+                except Exception as e: continue
         return Dataset.from_generator(gen)
 
     train_dataset = load_parquet_dataset(args.train)
@@ -128,16 +123,11 @@ def main():
 
     def process_data(examples):
         pixel_values = processor(images=examples["image"], return_tensors="pt").pixel_values
-        labels = tokenizer(
-            examples["text"], 
-            padding="max_length", 
-            max_length=args.max_len,
-            truncation=True
-        ).input_ids
+        labels = tokenizer(examples["text"], padding="max_length", max_length=args.max_len, truncation=True).input_ids
         labels = [[(l if l != tokenizer.pad_token_id else -100) for l in label] for label in labels]
         return {"pixel_values": pixel_values, "labels": labels}
 
-    print(f"Processing {len(train_dataset)} training examples...")
+    print(f"Processing {len(train_dataset)} examples...")
     train_dataset = train_dataset.map(process_data, batched=True, remove_columns=["image", "text"])
     eval_dataset = eval_dataset.map(process_data, batched=True, remove_columns=["image", "text"])
 
@@ -152,9 +142,7 @@ def main():
         pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
         labels_ids[labels_ids == -100] = tokenizer.pad_token_id
         label_str = tokenizer.batch_decode(labels_ids, skip_special_tokens=True)
-        
-        cer = cer_metric.compute(predictions=pred_str, references=label_str)
-        return {"cer": cer}
+        return {"cer": cer_metric.compute(predictions=pred_str, references=label_str)}
 
     training_args = Seq2SeqTrainingArguments(
         output_dir=args.output,
@@ -164,8 +152,8 @@ def main():
         predict_with_generate=True,
         evaluation_strategy="steps",
         save_strategy="steps",
-        eval_steps=500,
-        save_steps=500,
+        eval_steps=1000,
+        save_steps=1000,
         logging_steps=100,
         learning_rate=args.lr,
         num_train_epochs=args.epochs,
@@ -192,9 +180,9 @@ def main():
     print("Starting training...")
     trainer.train()
     
-    print(f"Saving model to {args.output}...")
     trainer.save_model(args.output)
     processor.save_pretrained(args.output)
+    print(f"✓ Model saved to {args.output}")
 
 if __name__ == "__main__":
     main()
