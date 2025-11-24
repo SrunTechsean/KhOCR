@@ -1,4 +1,3 @@
-%%writefile train_ocr.py
 import argparse
 import os
 
@@ -32,7 +31,14 @@ def main():
         XLMRobertaForCausalLM
     )
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"  # Apple Silicon GPU
+    else:
+        device = "cpu"
+        
+    print(f"✓ Device: {device}")
 
     # 1. Normalization
     try:
@@ -120,8 +126,7 @@ def main():
         per_device_eval_batch_size=args.batch,
         fp16=args.fp16,
         predict_with_generate=True,
-        # FIXED: evaluation_strategy -> eval_strategy
-        eval_strategy="steps",
+        evaluation_strategy="steps",
         save_strategy="steps",
         eval_steps=1000,
         save_steps=1000,
