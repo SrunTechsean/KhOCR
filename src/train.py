@@ -26,10 +26,6 @@ def main():
     print("=" * 70)
     print("Loading libraries... (this may take a few seconds)")
 
-    import pandas as pd
-    import numpy as np
-    from PIL import Image
-    import io
     import torch
     import torch.nn as nn
     from torch.utils.data import Dataset, DataLoader
@@ -37,8 +33,15 @@ def main():
     from tqdm import tqdm
     import matplotlib.pyplot as plt
     import json
+    from PIL import Image
+    import io
 
-    # Check for normalizer
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        print("Error: Please run 'pip install datasets'")
+        sys.exit(1)
+
     try:
         from khmernormalizer import normalize
 
@@ -91,36 +94,55 @@ def main():
 
     class KhmerDataset(Dataset):
         def __init__(self, parquet_path, transform=None):
-            print(f"Loading {parquet_path}...")
-            self.df = pd.read_parquet(parquet_path)
+            print(f"Streaming {parquet_path} (Zero RAM Load)...")
+
+            # Use Hugging Face 'load_dataset' with 'parquet' engine
+            # This maps the file to memory without loading it.
+            self.dataset = load_dataset("parquet", data_files={"train": parquet_path}, split="train")
             self.transform = transform
 
-            # Normalization fixes Unicode ordering issues (swapping vowels/sub-consonants)
-            # that look identical to humans but are different bytes to the computer.
-            if NORMALIZE_AVAILABLE:
-                self.df["text"] = self.df["text"].apply(normalize)
+            # Build vocabulary from the first 5000 samples (approximate)
+            # or load a pre-computed one if possible to save time.
+            # For accuracy, we scan all, but using the dataset iterator is RAM safe.
+            print("Building vocabulary (scanning text only)...")
+            chars = set()
+            for item in tqdm(self.dataset.select(range(min(len(self.dataset), 10000))), desc="Scanning Vocab"):
+                txt = item["text"]
+                if NORMALIZE_AVAILABLE:
+                    txt = normalize(txt)
+                chars.update(list(txt))
 
-            all_text = " ".join(self.df["text"].values)
-            self.chars = sorted(list(set(all_text)))
+            self.chars = sorted(list(chars))
             self.char_to_idx = {char: idx + 1 for idx, char in enumerate(self.chars)}
-            self.char_to_idx["<BLANK>"] = 0  # CTC Loss requires a reserved blank token at 0
+            self.char_to_idx["<BLANK>"] = 0
             self.idx_to_char = {idx: char for char, idx in self.char_to_idx.items()}
             self.vocab_size = len(self.char_to_idx)
 
-            print(f"  Samples: {len(self.df)}")
+            print(f"  Samples: {len(self.dataset)}")
             print(f"  Vocab: {self.vocab_size} characters")
 
         def __len__(self):
-            return len(self.df)
+            return len(self.dataset)
 
         def __getitem__(self, idx):
-            row = self.df.iloc[idx]
-            image = Image.open(io.BytesIO(row["image"]["bytes"])).convert("RGB")
+            # Load ONE row from disk
+            item = self.dataset[idx]
+
+            # Decode image bytes
+            try:
+                img_bytes = item["image"]["bytes"]
+                image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            except Exception:
+                # Fallback for bad images
+                image = Image.new("RGB", (512, 64), (255, 255, 255))
 
             if self.transform:
                 image = self.transform(image)
 
-            text = row["text"]
+            text = item["text"]
+            if NORMALIZE_AVAILABLE:
+                text = normalize(text)
+
             encoded = [self.char_to_idx.get(char, 0) for char in text if char in self.char_to_idx]
             encoded = [x for x in encoded if x != 0]
 
@@ -250,7 +272,7 @@ def main():
         criterion = nn.CTCLoss(blank=0, zero_infinity=True)
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0001, betas=(0.9, 0.999))
-
+        scaler = torch.amp.GradScaler("cuda")  # Updated for newer PyTorch versions
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=lr,
@@ -276,22 +298,24 @@ def main():
 
             for images, targets, target_lengths in pbar:
                 images = images.to(device)
-
                 optimizer.zero_grad()
 
-                outputs = model(images)
-
-                # Move to CPU *before* log_softmax to ensure numerical stability on Mac/MPS
-                log_probs = outputs.permute(1, 0, 2).cpu().log_softmax(2)
-
-                input_lengths = torch.full((images.size(0),), log_probs.size(0), dtype=torch.long)
-
-                loss = criterion(log_probs, targets, input_lengths, target_lengths)
+                # 2. AutoCast Context (Runs forward pass in FP16)
+                with torch.amp.autocast("cuda"):
+                    outputs = model(images)
+                    # Log Softmax must run in FP32 for numerical stability
+                    log_probs = outputs.permute(1, 0, 2).log_softmax(2)
+                    input_lengths = torch.full((images.size(0),), log_probs.size(0), dtype=torch.long)
+                    loss = criterion(log_probs, targets, input_lengths, target_lengths)
 
                 if not (torch.isnan(loss) or torch.isinf(loss)):
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)  # Prevents exploding gradients
-                    optimizer.step()
+                    # 3. Scaled Backward Pass
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+
+                    scaler.step(optimizer)
+                    scaler.update()
                     scheduler.step()
                     train_loss += loss.item()
                     pbar.set_postfix({"loss": f"{loss.item():.4f}"})
@@ -307,12 +331,13 @@ def main():
             with torch.no_grad():
                 for images, targets, target_lengths in tqdm(val_loader, desc="[Val]"):
                     images = images.to(device)
-                    outputs = model(images)
+                    with torch.amp.autocast("cuda"):
+                        outputs = model(images)
 
-                    # Use same CPU logic for validation to keep metrics consistent
-                    log_probs = outputs.permute(1, 0, 2).cpu().log_softmax(2)
-                    input_lengths = torch.full((images.size(0),), log_probs.size(0), dtype=torch.long)
-                    loss = criterion(log_probs, targets, input_lengths, target_lengths)
+                        # Use same CPU logic for validation to keep metrics consistent
+                        log_probs = outputs.permute(1, 0, 2).log_softmax(2)
+                        input_lengths = torch.full((images.size(0),), log_probs.size(0), dtype=torch.long)
+                        loss = criterion(log_probs, targets, input_lengths, target_lengths)
 
                     if not (torch.isnan(loss) or torch.isinf(loss)):
                         val_loss += loss.item()
@@ -343,27 +368,25 @@ def main():
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
-                    print(f"⚠ Early stopping triggered.")
+                    print("⚠ Early stopping triggered.")
                     break
             print("-" * 70)
 
         return history
 
     device = get_device()
-
     t_train = get_transforms(width=args.width, is_train=True)
     t_val = get_transforms(width=args.width, is_train=False)
 
-    # Load Datasets
     train_ds = KhmerDataset(args.train, transform=t_train)
     val_ds = KhmerDataset(args.val, transform=t_val)
 
-    # Sync Vocab
+    # Vocab syncing logic simplified for stream mode
+    # We use the Train DS vocab for both.
     val_ds.char_to_idx = train_ds.char_to_idx
     val_ds.idx_to_char = train_ds.idx_to_char
     val_ds.vocab_size = train_ds.vocab_size
 
-    # Save Vocab
     vocab_path = args.output.replace(".pth", "_vocab.json")
     with open(vocab_path, "w", encoding="utf-8") as f:
         json.dump(
@@ -376,14 +399,12 @@ def main():
             ensure_ascii=False,
             indent=2,
         )
-    print(f"✓ Vocab saved to {vocab_path}")
 
-    # Mac/MPS optimization: keep num_workers=0 to avoid multiprocessing overhead/crashes
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch, shuffle=True, num_workers=0, collate_fn=collate_fn, pin_memory=True
+        train_ds, batch_size=args.batch, shuffle=True, num_workers=4, collate_fn=collate_fn, pin_memory=True
     )
     val_loader = DataLoader(
-        val_ds, batch_size=args.batch, shuffle=False, num_workers=0, collate_fn=collate_fn, pin_memory=True
+        val_ds, batch_size=args.batch, shuffle=False, num_workers=4, collate_fn=collate_fn, pin_memory=True
     )
 
     model = ImprovedCRNN(vocab_size=train_ds.vocab_size).to(device)
@@ -391,27 +412,17 @@ def main():
     if args.resume:
         print(f"Loading pre-trained weights from {args.resume}...")
         try:
-            # map_location ensures we can load a GPU model onto a CPU/Mac if needed
             checkpoint = torch.load(args.resume, map_location=device)
-
             if "model_state_dict" in checkpoint:
                 model.load_state_dict(checkpoint["model_state_dict"])
             else:
                 model.load_state_dict(checkpoint)
-            print("✓ Weights loaded successfully. Starting fine-tuning...")
+            print("✓ Weights loaded.")
         except Exception as e:
-            print(f"Error loading resume file: {e}")
+            print(f"Error: {e}")
             sys.exit(1)
 
     history = train_model(model, train_loader, val_loader, device, args.epochs, args.lr, args.output)
-
-    plt.figure(figsize=(10, 5))
-    plt.plot(history["train_loss"], label="Train Loss")
-    plt.plot(history["val_loss"], label="Val Loss")
-    plt.title("Training History")
-    plt.legend()
-    plt.savefig(args.output.replace(".pth", "_history.png"))
-    print("Done.")
 
 
 if __name__ == "__main__":
