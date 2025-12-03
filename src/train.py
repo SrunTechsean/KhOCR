@@ -4,7 +4,7 @@ import os
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Khmer OCR Model (CRNN) - Mac/MPS Optimized")
+    parser = argparse.ArgumentParser(description="Train Khmer OCR Model")
     parser.add_argument("--train", type=str, required=True, help="Path to training parquet file")
     parser.add_argument("--val", type=str, required=True, help="Path to validation parquet file")
     parser.add_argument("--output", type=str, default="best_khmer_ocr_model.pth", help="Path to save trained model")
